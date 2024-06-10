@@ -9,10 +9,8 @@ from openai import OpenAI
 from fuzzywuzzy import fuzz
 import time
 
-# Initialize Flask app
 app = Flask(__name__)
-
-# Set up your OpenAI API key
+#set your openai key through "$env:OPENAI_API_KEY='#'""
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def get_topic_from_query(query):
