@@ -1,25 +1,23 @@
+import os
+import re
+import json
 import asyncio
 import aiohttp
-from pathlib import Path
-import wikipedia
-import os
-from openai import OpenAI
-import re
-from google.cloud import storage
-from urllib.parse import quote
 import time
 from flask import Flask, request, jsonify
+from openai import OpenAI
+from fuzzywuzzy import fuzz
+import time
 
+# Initialize Flask app
 app = Flask(__name__)
 
 # Set up your OpenAI API key
-client = OpenAI(api_key='###')
-storage_client = storage.Client.from_service_account_json('C:/Users/jram1/CapstoneML_Test/eng4k-capstone-server-978cc76d266b.json')
-bucket_name = 'wikipedia-images'
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def get_topic_from_query(query):
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": f"""
@@ -32,23 +30,37 @@ def get_topic_from_query(query):
              """}
         ],
         temperature=0.5,
-        max_tokens=150
+        max_tokens=50
     )
-    topic = response.choices[0].message.content
+    topic = response.choices[0].message.content.strip()
     print(topic)
     return topic
 
+async def search_wikipedia(topic, session):
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": topic,
+        "format": "json"
+    }
+    async with session.get(url, params=params) as response:
+        data = await response.json()
+        if 'query' in data and 'search' in data['query']:
+            search_results = data['query']['search']
+            if search_results:
+                return search_results[0]['title']
+        return None
+
 async def fetch_text_and_images(title, session):
-    data_path = Path("data_wiki_text")
-    image_path = Path("data_wiki_images")
+    text_task = fetch_text(session, title)
+    image_titles_urls_task = fetch_image_titles_urls(session, title)
+    
+    text, image_titles_urls = await asyncio.gather(text_task, image_titles_urls_task)
+    images = await fetch_images(session, image_titles_urls)
+    return text, images, image_titles_urls
 
-    text, page = await fetch_text(session, title, data_path)
-
-    await fetch_and_save_images(title, image_path, session)
-
-    return text, image_path
-
-async def fetch_text(session, title, data_path):
+async def fetch_text(session, title):
     url = "https://en.wikipedia.org/w/api.php"
     params = {
         "action": "query",
@@ -61,38 +73,83 @@ async def fetch_text(session, title, data_path):
         data = await response.json()
         page = next(iter(data["query"]["pages"].values()), None)
         if page and 'extract' in page:
-            text_path = data_path/ f"{title}.txt"
-            data_path.mkdir(parents=True, exist_ok=True)
-            with open(text_path, "w", encoding='utf-8') as file:
-                file.write(page['extract'])
-            return page['extract'], page
-        return None, None
+            return page['extract']
+        return None
 
-async def fetch_and_save_images(title, image_path, session):
-    page_py = wikipedia.page(title)
-    all_image_urls = page_py.images
-    filtered_urls = [url for url in all_image_urls if url.endswith((".jpg", ".png", ".svg"))]
-    tasks = [download_and_upload_image(session, url, image_path / f"{title}_{url.split('/')[-1]}") for url in filtered_urls]
-    await asyncio.gather(*tasks)
+async def fetch_image_titles_urls(session, title):
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "titles": title,
+        "prop": "images",
+        "imlimit": "max"
+    }
+    async with session.get(url, params=params) as response:
+        data = await response.json()
+        page = next(iter(data["query"]["pages"].values()), None)
+        if page and 'images' in page:
+            image_titles = [img['title'] for img in page['images']]
+            image_titles = [img for img in image_titles if img.lower().endswith(('.png', '.jpg', '.jpeg', '.svg'))]
+            image_info_tasks = [fetch_image_info(session, img_title) for img_title in image_titles]
+            image_info_list = await asyncio.gather(*image_info_tasks)
+            image_titles_urls = [info for info in image_info_list if info]
+            return image_titles_urls
+        return []
 
-async def download_and_upload_image(session, url, image_path):
-    try:
+async def fetch_image_info(session, title):
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "titles": title,
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata",
+    }
+    async with session.get(url, params=params) as response:
+        data = await response.json()
+        page = next(iter(data["query"]["pages"].values()), None)
+        if page and 'imageinfo' in page:
+            image_info = page['imageinfo'][0]
+            if 'url' in image_info and image_info['url'].startswith('http'):
+                caption = image_info['extmetadata'].get('ImageDescription', {}).get('value', 'No caption available')
+                description = image_info['extmetadata'].get('ObjectName', {}).get('value', 'No description available')
+                if is_plain_text(caption):
+                    return {'title': title, 'url': image_info['url'], 'description': description, 'caption': caption}
+                else:
+                    return {'title': title, 'url': image_info['url'], 'description': description, 'caption': "No suitable image description returned."}
+        return None
+
+async def fetch_images(session, image_titles_urls):
+    images = []
+    for image_info in image_titles_urls:
+        url = image_info['url']
         async with session.get(url) as response:
             if response.status == 200:
-                image_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(image_path, "wb") as f:
-                    while True:
-                        chunk = await response.content.read(1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                bucket = storage_client.bucket(bucket_name)
-                blob = bucket.blob(str(image_path))
-                blob.upload_from_filename(str(image_path))
+                images.append({'title': image_info['title'], 'url': url, 'data': await response.read(), 'description': image_info['description'], 'caption': image_info['caption']})
             else:
-                print(f"Failed to download image from {url}")
-    except Exception as e:
-        print(f"Error downloading image: {e}")
+                print(f"Failed to fetch image: {image_info['title']} with status: {response.status}")
+    return images
+
+def rank_images_by_relevance(query, image_titles_urls):
+    cleaned_query = query.lower()
+    ranked_images = []
+
+    for image_info in image_titles_urls:
+        title = re.sub(r'^File:|\.jpg$|\.png$|\.gif$|\.svg$|\.ogv$|\.ogg$', '', image_info['title']).replace('_', ' ').strip()
+        url = image_info['url']
+        cleaned_title = title.lower()
+        score = fuzz.partial_ratio(cleaned_query, cleaned_title)
+        ranked_images.append((title, url, score, image_info['description'], image_info['caption']))
+
+    ranked_images.sort(key=lambda x: x[2], reverse=True)
+    
+    top_images = [(title, url, description, caption) for title, url, score, description, caption in ranked_images if score > 0]
+    
+    print("Top ranked image URLs:")
+    for title, url, description, caption in top_images[:3]:
+        print(f"Image Title: {title}, Image URL: {url}, Description: {description}, Caption: {caption}")
+    return top_images
 
 def generate_summary(query, text, max_tokens=300, temperature=0.5):
     response = client.chat.completions.create(
@@ -116,77 +173,61 @@ def generate_summary(query, text, max_tokens=300, temperature=0.5):
         max_tokens=max_tokens
     )
     summary = response.choices[0].message.content.strip()
-    print("Summary", summary)
     return summary
-
-
-def rank_images_by_title(query, image_titles, image_urls):
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant designed to output in JSON."},
-            {"role": "user", "content": f"""
-             Read the image titles: {image_urls}.
-             Rank the titles within the image urls based on their relevance to the user's query: {query}.
-             Return the top 3 imageURLs using the following structure
-                        
-                    (
-            "Top URLs": 
-                "ImageURL1": "Actual Image URL",
-                "ImageURL2": "Actual Image URL",
-                "ImageURL3": "Actual Image URL"
-            )
-         
-             """}
-        ],
-        temperature=0.5,
-        max_tokens=200
-    )
-    top_images = response.choices[0].message.content    
-    print("\n", top_images)
-    return top_images
-
-async def delete_gcs_directory(bucket_name, prefix):
-    bucket = storage_client.bucket(bucket_name)
-    blobs = bucket.list_blobs(prefix=prefix)
-    for blob in blobs:
-        # print(f"Deleting blob: {blob.name}")
-        blob.delete()
-
 
 async def process_query(query):
     async with aiohttp.ClientSession() as session:
         main_topic = get_topic_from_query(query)
-        if not main_topic:
-            return {'error': 'Could not determine the main topic'}
-        
-        text, image_path = await fetch_text_and_images(main_topic, session)
-        if text:
-            summary = generate_summary(query, text)
-            image_titles = [img.stem for img in image_path.glob('*.*')]
-            image_urls = ["https://storage.googleapis.com/{}/{}".format(bucket_name, quote(str(img))) for img in image_path.glob('*.*')]
-            top_images_with_urls = rank_images_by_title(query, image_titles, image_urls)
-
-            response = {
-                'summary': summary,
-                'images': top_images_with_urls
-            }
+        if main_topic:
+            article_title = await search_wikipedia(main_topic, session)
+            if article_title:
+                text, images, image_titles_urls = await fetch_text_and_images(article_title, session)
+                if text:
+                    summary = await asyncio.to_thread(generate_summary, query, text)
+                    top_images = rank_images_by_relevance(main_topic, image_titles_urls)
+                    
+                    top_three_images = {}
+                    for i, (title, url, description, caption) in enumerate(top_images[:3]):
+                        top_three_images[f"Image {i+1}"] = {"Title": title, "URL": url, "Description": description, "Caption": caption}
+                    
+                    json_response = {
+                        "Summary": summary,
+                        "Top Three Images": top_three_images
+                    }
+                    
+                    return json_response
+                else:
+                    return {"error": "Failed to fetch Wikipedia text."}
+            else:
+                return {"error": "No relevant Wikipedia article found."}
         else:
-            response = {'error': 'Failed to fetch Wikipedia text'}
-        
-        await delete_gcs_directory(bucket_name, "data_wiki_images/")
-        return response
-    
+            return {"error": "Failed to process the query."}
+
+def is_plain_text(text):
+    return not bool(re.search(r'<[^>]+>', text))
+
 @app.route('/query', methods=['POST'])
 def handle_query():
     data = request.json
-    query = data.get('query')
-    if not query:
-        return jsonify({'error': 'Query is required'}), 400
-    
-    response = asyncio.run(process_query(query))
-    return jsonify(response)
+    query = data.get('query', '')
+    print("Received query:", query)  # Debugging print statement
 
-if __name__ == '__main__':
+    start_time = time.time()  # Record the start time
+    print("Start time:", start_time)  # Debugging print statement
+
+    if not query:
+        return jsonify({"error": "No query provided."}), 400
+    
+    try:
+        result = asyncio.run(process_query(query))
+        end_time = time.time()  # Record the end time
+        print("End time:", end_time)  # Debugging print statement
+        print(f"Time taken: {end_time - start_time} seconds")  # Print the duration    
+        return jsonify(result)
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        return jsonify({"error": "An error occurred while processing the query."}), 500
+
+
+if __name__ == "__main__":
     app.run(debug=True)

@@ -3,3 +3,4 @@ env/
 data_wiki_images/
 data_wiki_text/
 extras/
+__pycache__/
